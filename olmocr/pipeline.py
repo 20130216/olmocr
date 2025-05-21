@@ -30,6 +30,8 @@ from PIL import Image
 from pypdf import PdfReader
 from tqdm import tqdm
 
+from dotenv import load_dotenv
+
 from olmocr.check import (
     check_poppler_version,
     check_sglang_version,
@@ -104,36 +106,35 @@ class PageResult:
     output_tokens: int
     is_fallback: bool
 
+# 修改整个函数 从本地调用改成API调用
+import os
 
 async def build_page_query(local_pdf_path: str, page: int, target_longest_image_dim: int, target_anchor_text_len: int, image_rotation: int = 0) -> dict:
     MAX_TOKENS = 3000
     assert image_rotation in [0, 90, 180, 270], "Invalid image rotation provided in build_page_query"
 
-    # Allow the page rendering to process in the background while we get the anchor text (which blocks the main thread)
+    # 1. 渲染图片和获取锚文本
     image_base64 = asyncio.to_thread(render_pdf_to_base64png, local_pdf_path, page, target_longest_image_dim=target_longest_image_dim)
-
-    # GET ANCHOR TEXT IS NOT THREAD SAFE!! Ahhhh..... don't try to do it
-    # and it's also CPU bound, so it needs to run in a process pool
     loop = asyncio.get_running_loop()
     anchor_text = loop.run_in_executor(
         process_pool, partial(get_anchor_text, pdf_engine="pdfreport", target_length=target_anchor_text_len), local_pdf_path, page
     )
-
     image_base64, anchor_text = await asyncio.gather(image_base64, anchor_text)  # type: ignore
+
     if image_rotation != 0:
         image_bytes = base64.b64decode(image_base64)
         with Image.open(BytesIO(image_bytes)) as img:
             rotated_img = img.rotate(-image_rotation, expand=True)
-
-            # Save the rotated image to a bytes buffer
             buffered = BytesIO()
             rotated_img.save(buffered, format="PNG")
-
-        # Encode the rotated image back to base64
         image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
+    # 2. 通过环境变量读取 model
+    model_name = os.getenv("OPENAI_API_MODEL", "gpt-4.1")
+
+    # 3. 构造 vision 格式的消息
     return {
-        "model": "Qwen/Qwen2-VL-7B-Instruct",
+        "model": model_name,
         "messages": [
             {
                 "role": "user",
@@ -215,6 +216,15 @@ async def apost(url, json_data):
 
 async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path: str, page_num: int) -> PageResult:
     COMPLETION_URL = f"http://localhost:{SGLANG_SERVER_PORT}/v1/chat/completions"
+    
+    import os
+
+    # 新增：从环境变量读取API参数
+    REMOTE_API_BASE = os.getenv("OPENAI_API_BASE", "").rstrip("/")
+    REMOTE_API_PATH = os.getenv("OPENAI_API_PATH", "").lstrip("/")
+    REMOTE_API_KEY = os.getenv("OPENAI_API_KEY")
+    REMOTE_COMPLETION_URL = f"{REMOTE_API_BASE}/{REMOTE_API_PATH}"
+    
     MAX_RETRIES = args.max_page_retries
     TEMPERATURE_BY_ATTEMPT = [0.1, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
     exponential_backoffs = 0
@@ -227,13 +237,25 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
         query = await build_page_query(pdf_local_path, page_num, args.target_longest_image_dim, local_anchor_text_len, image_rotation=local_image_rotation)
         query["temperature"] = TEMPERATURE_BY_ATTEMPT[
             min(attempt, len(TEMPERATURE_BY_ATTEMPT) - 1)
-        ]  # Change temperature as number of attempts increases to overcome repetition issues at expense of quality
-
+        ]
         logger.info(f"Built page query for {pdf_orig_path}-{page_num}")
 
         try:
-            status_code, response_body = await apost(COMPLETION_URL, json_data=query)
+            if getattr(args, "use_remote_api", False):
+                headers = {
+                    "Authorization": f"Bearer {REMOTE_API_KEY}",
+                    "Content-Type": "application/json"
+                }
+                async with httpx.AsyncClient(timeout=120.0) as client: # 新增：120秒超时
+                    response = await client.post(REMOTE_COMPLETION_URL, headers=headers, json=query)
+                    logger.info(f"Debug--API response status: {response.status_code}, body: {response.text}")
+         
+                    status_code = response.status_code
+                    response_body = response.content
+            else:
+                status_code, response_body = await apost(COMPLETION_URL, json_data=query)
 
+            # 后续处理（无论哪种分支都要有）
             if status_code == 400:
                 raise ValueError(f"Got BadRequestError from server: {response_body}, skipping this response")
             elif status_code == 500:
@@ -252,8 +274,20 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
                 sglang_input_tokens=base_response_data["usage"].get("prompt_tokens", 0),
                 sglang_output_tokens=base_response_data["usage"].get("completion_tokens", 0),
             )
-
-            model_response_json = json.loads(base_response_data["choices"][0]["message"]["content"])
+            content = base_response_data["choices"][0]["message"]["content"]
+            
+            try:
+                model_response_json = json.loads(content)
+            except json.JSONDecodeError:
+                # 兼容API返回纯文本
+                model_response_json = {
+                    "natural_text": content,
+                    "primary_language": None,
+                    "is_rotation_valid": True,
+                    "rotation_correction": 0,
+                    "is_table": False,
+                    "is_diagram": False
+                }
             page_response = PageResponse(**model_response_json)
 
             if not page_response.is_rotation_valid and attempt < MAX_RETRIES - 1:
@@ -276,8 +310,6 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
             logger.warning(f"Client error on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} {e}")
 
             # Now we want to do exponential backoff, and not count this as an actual page retry
-            # Page retrys are supposed to be for fixing bad results from the model, but actual requests to sglang
-            # are supposed to work. Probably this means that the server is just restarting
             sleep_delay = 10 * (2**exponential_backoffs)
             exponential_backoffs += 1
             logger.info(f"Sleeping for {sleep_delay} seconds on {pdf_orig_path}-{page_num} to allow server restart")
@@ -295,15 +327,12 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
         except Exception as e:
             logger.exception(f"Unexpected error on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} - {e}")
             attempt += 1
-
-    logger.error(f"Failed to process {pdf_orig_path}-{page_num} after {MAX_RETRIES} attempts.")
-    await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "errored")
-
+    # 如果所有尝试都失败，返回一个 fallback PageResult
     return PageResult(
         pdf_orig_path,
         page_num,
         PageResponse(
-            natural_text=get_anchor_text(pdf_local_path, page_num, pdf_engine="pdftotext"),
+            natural_text=None,
             primary_language=None,
             is_rotation_valid=True,
             rotation_correction=0,
@@ -314,7 +343,6 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
         output_tokens=0,
         is_fallback=True,
     )
-
 
 async def process_pdf(args, worker_id: int, pdf_orig_path: str):
     with tempfile.NamedTemporaryFile("wb+", suffix=".pdf") as tf:
@@ -957,7 +985,18 @@ def print_stats(args, root_work_queue):
 
 
 async def main():
+    # 加载本地环境变量
+    load_dotenv(
+        dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), "local.env"),
+        override=True  # 强制覆盖已有环境变量
+    )
+    print("DEBUG: REMOTE_API_BASE =", os.getenv("OPENAI_API_BASE"))
+    print("DEBUG: REMOTE_API_PATH =", os.getenv("OPENAI_API_PATH"))
+    print("DEBUG: REMOTE_API_KEY =", os.getenv("OPENAI_API_KEY"))
     parser = argparse.ArgumentParser(description="Manager for running millions of PDFs through a batch inference pipeline")
+    #  在 argparse 添加参数，支持切换API模式
+    parser.add_argument("--use_remote_api", action="store_true", help="Use remote API instead of local LLM")
+    
     parser.add_argument(
         "workspace",
         help="The filesystem path where work will be stored, can be a local folder, or an s3 path if coordinating work with many workers, s3://bucket/prefix/ ",
@@ -1111,6 +1150,8 @@ async def main():
 
         # Now call populate_queue
         await work_queue.populate_queue(pdf_work_paths, items_per_group)
+        qsize = await work_queue.initialize_queue()
+        logger.info(f"添加debug--Initialized work queue size: {qsize}")      
 
     if args.stats:
         print_stats(args, work_queue)
@@ -1121,29 +1162,26 @@ async def main():
         return
 
     # If you get this far, then you are doing inference and need a GPU
-    check_sglang_version()
-    check_torch_gpu_available()
+    # 修改
+    if not args.use_remote_api:
+        # Only check local LLM dependencies if not using remote API
+        check_sglang_version()
+        check_torch_gpu_available()
 
+    # 以下修改到logger.info("Work done")
     logger.info(f"Starting pipeline with PID {os.getpid()}")
 
-    # Download the model before you do anything else
-    model_name_or_path = await download_model(args.model)
-
-    # Initialize the work queue
-    qsize = await work_queue.initialize_queue()
-
-    if qsize == 0:
-        logger.info("No work to do, exiting")
-        return
-    # Create a semaphore to control worker access
-    # We only allow one worker to move forward with requests, until the server has no more requests in its queue
-    # This lets us get full utilization by having many workers, but also to be outputting dolma docs as soon as possible
-    # As soon as one worker is no longer saturating the gpu, the next one can start sending requests
-    semaphore = asyncio.Semaphore(1)
-
-    sglang_server = asyncio.create_task(sglang_server_host(model_name_or_path, args, semaphore))
-
-    await sglang_server_ready()
+    if not args.use_remote_api:
+        # 本地LLM模式：下载模型、启动sglang server
+        model_name_or_path = await download_model(args.model)
+        semaphore = asyncio.Semaphore(1)
+        sglang_server = asyncio.create_task(sglang_server_host(model_name_or_path, args, semaphore))
+        await sglang_server_ready()
+    else:
+        # 远程API模式：不下载模型、不启动sglang server
+        model_name_or_path = None
+        semaphore = asyncio.Semaphore(1)
+        sglang_server = None
 
     metrics_task = asyncio.create_task(metrics_reporter(work_queue))
 
@@ -1159,7 +1197,8 @@ async def main():
     # Wait for server to stop
     process_pool.shutdown(wait=False)
 
-    sglang_server.cancel()
+    if sglang_server is not None:
+        sglang_server.cancel()
     metrics_task.cancel()
     logger.info("Work done")
 

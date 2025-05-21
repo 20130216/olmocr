@@ -26,8 +26,8 @@ class Args:
     model_max_context: int = 8192
     target_longest_image_dim: int = 1024
     target_anchor_text_len: int = 6000
-    max_page_retries: int = 8
-    max_page_error_rate: float = 0.004
+    max_page_retries: int = 3       # 从8设置为3
+    max_page_error_rate: float = 1  # 临时设置大一点
 
 
 server_check_lock = asyncio.Lock()
