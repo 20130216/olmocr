@@ -14,6 +14,7 @@ import shutil
 import sys
 import tempfile
 import time
+import glob
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
@@ -487,7 +488,7 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
             for task in dolma_tasks:
                 try:
                     result = task.result()
-                except:
+                except Exception:
                     # some dolma doc creations may have failed
                     pass
 
@@ -496,54 +497,53 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
 
             logger.info(f"Got {len(dolma_docs)} docs for {work_item.hash}")
 
-            # Write the Dolma documents to a local temporary file in JSONL format
-            with tempfile.NamedTemporaryFile(mode="w+", delete=False) as tf:
-                for doc in dolma_docs:
-                    tf.write(json.dumps(doc))
-                    tf.write("\n")
-                tf.flush()
-                temp_path = tf.name
+            # === 优化后的输出逻辑，支持单文件和多文件/目录 ===
+            pdf_paths = work_item.work_paths
+            if len(pdf_paths) == 1:
+                # 单文件，兼容原有逻辑
+                pdf_path = pdf_paths[0]
+                pdf_dir = os.path.dirname(pdf_path)
+                parent_dir = os.path.dirname(pdf_dir)
+                dir_name = os.path.basename(pdf_dir)
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                target_root_dir = os.path.join(parent_dir, f"{dir_name}_md+jsonl_{timestamp}")
+                os.makedirs(target_root_dir, exist_ok=True)
+                rel_dir = ""
+                common_prefix = pdf_dir  # 兼容后续 relpath
+            else:
+                # 多文件，找出共同父目录
+                from os.path import commonprefix, dirname, relpath, join, basename, splitext
+                common_prefix = os.path.commonprefix(pdf_paths)
+                if not os.path.isdir(common_prefix):
+                    common_prefix = os.path.dirname(common_prefix)
+                dir_name = os.path.basename(common_prefix.rstrip("/"))
+                parent_dir = os.path.dirname(common_prefix.rstrip("/"))
+                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+                target_root_dir = os.path.join(parent_dir, f"{dir_name}_md+jsonl_{timestamp}")
+                os.makedirs(target_root_dir, exist_ok=True)
 
-            try:
-                # Define the output S3 path using the work_hash
-                # output_final_path = os.path.join(args.workspace, "results", f"output_{work_item.hash}.jsonl")
-                # 优化为：md/jsonl都写到pdf目录的平行目录
-                if len(work_item.work_paths) == 1:
-                    pdf_path = work_item.work_paths[0]
-                    pdf_dir = os.path.dirname(pdf_path)
-                    pdf_basename = os.path.splitext(os.path.basename(pdf_path))[0]
-                    parent_dir = os.path.dirname(pdf_dir)
-                    dir_name = os.path.basename(pdf_dir)
-                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-                    target_dir = os.path.join(parent_dir, f"{dir_name}_md+jsonl_{timestamp}")
-                    os.makedirs(target_dir, exist_ok=True)
-                    output_final_path = os.path.join(target_dir, f"output_{pdf_basename}.jsonl")
+            for doc in dolma_docs:
+                source_file = doc["metadata"]["Source-File"]
+                natural_text = doc["text"]
+                pdf_basename = os.path.splitext(os.path.basename(source_file))[0]
+                # 计算相对路径
+                if len(pdf_paths) == 1:
+                    rel_dir = ""
                 else:
-                    output_final_path = os.path.join(args.workspace, "results", f"output_{work_item.hash}.jsonl")
-
-                if output_final_path.startswith("s3://"):
-                    bucket, key = parse_s3_path(output_final_path)
-                    workspace_s3.upload_file(temp_path, bucket, key)
-                else:
-                    shutil.copyfile(temp_path, output_final_path)
-            finally:
-                if os.path.exists(temp_path):
-                    os.unlink(temp_path)
-
-            # If --markdown flag is set, also write the natural text to markdown files
-            if args.markdown:
-                logger.info(f"Writing {len(dolma_docs)} markdown files for {work_item.hash}")
-                for doc in dolma_docs:
-                    print("DEBUG: doc Source-File:", doc["metadata"]["Source-File"])
-                    source_file = doc["metadata"]["Source-File"]
-                    natural_text = doc["text"]
-                    md_filename = os.path.splitext(os.path.basename(source_file))[0] + ".md"
-                    # md 文件也写到 target_dir
+                    rel_dir = os.path.dirname(os.path.relpath(source_file, common_prefix))
+                target_dir = os.path.join(target_root_dir, rel_dir)
+                os.makedirs(target_dir, exist_ok=True)
+                # 写 jsonl
+                output_final_path = os.path.join(target_dir, f"output_{pdf_basename}.jsonl")
+                with open(output_final_path, "w") as jf:
+                    jf.write(json.dumps(doc, ensure_ascii=False) + "\n")
+                # 写 md
+                if args.markdown:
+                    md_filename = f"{pdf_basename}.md"
                     markdown_path = os.path.join(target_dir, md_filename)
                     with open(markdown_path, "w") as md_f:
                         md_f.write(natural_text)
 
-            # Update finished token counts from successful documents
             metrics.add_metrics(
                 finished_input_tokens=sum(doc["metadata"]["total-input-tokens"] for doc in dolma_docs),
                 finished_output_tokens=sum(doc["metadata"]["total-output-tokens"] for doc in dolma_docs),
@@ -554,7 +554,6 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
             logger.exception(f"Exception occurred while processing work_hash {work_item.hash}: {e}")
         finally:
             semaphore.release()
-
 
 async def sglang_server_task(model_name_or_path, args, semaphore):
     # Check GPU memory, lower mem devices need a bit less KV cache space because the VLM takes additional memory
@@ -962,9 +961,21 @@ def print_stats(args, root_work_queue):
     print(f"\nLong Context Documents (>{LONG_CONTEXT_THRESHOLD} tokens): {long_context_docs_count:,}")
     print(f"Total tokens in long context documents: {long_context_tokens_total:,}")
 
-
-import glob
-import os
+#  新增工具函数   递归收集 PDF 文件
+def collect_pdf_files(paths):
+    import glob
+    pdf_files = set()
+    for path in paths:
+        if os.path.isdir(path):
+            for root, dirs, files in os.walk(path):
+                for file in files:
+                    if file.lower().endswith(".pdf"):
+                        pdf_files.add(os.path.join(root, file))
+        elif "*" in path or "?" in path or "[" in path:
+            pdf_files |= set(glob.glob(path, recursive=True))
+        elif os.path.isfile(path) and path.lower().endswith(".pdf"):
+            pdf_files.add(path)
+    return pdf_files
 
 def clean_workspace_queue_files(workspace_path):
     if not workspace_path.startswith("s3://"):
@@ -1092,38 +1103,9 @@ async def main():
 
     if args.pdfs:
         logger.info("Got --pdfs argument, going to add to the work queue")
-        pdf_work_paths = set()
-
-        for pdf_path in args.pdfs:
-            # Expand s3 paths
-            if pdf_path.startswith("s3://"):
-                logger.info(f"Expanding s3 glob at {pdf_path}")
-                pdf_work_paths |= set(expand_s3_glob(pdf_s3, pdf_path))
-            elif os.path.exists(pdf_path):
-                if (
-                    pdf_path.lower().endswith(".pdf")
-                    or pdf_path.lower().endswith(".png")
-                    or pdf_path.lower().endswith(".jpg")
-                    or pdf_path.lower().endswith(".jpeg")
-                ):
-                    if open(pdf_path, "rb").read(4) == b"%PDF":
-                        logger.info(f"Loading file at {pdf_path} as PDF document")
-                        pdf_work_paths.add(pdf_path)
-                    elif is_png(pdf_path) or is_jpeg(pdf_path):
-                        logger.info(f"Loading file at {pdf_path} as image document")
-                        pdf_work_paths.add(pdf_path)
-                    else:
-                        logger.warning(f"File at {pdf_path} is not a valid PDF")
-                elif pdf_path.lower().endswith(".txt"):
-                    logger.info(f"Loading file at {pdf_path} as list of paths")
-                    with open(pdf_path, "r") as f:
-                        pdf_work_paths |= set(filter(None, (line.strip() for line in f)))
-                else:
-                    raise ValueError(f"Unsupported file extension for {pdf_path}")
-            else:
-                raise ValueError("pdfs argument needs to be either a local path, an s3 path, or an s3 glob pattern...")
-
+        pdf_work_paths = collect_pdf_files(args.pdfs)
         logger.info(f"Found {len(pdf_work_paths):,} total pdf paths to add")
+        # 后续直接用 pdf_work_paths 进行 populate_queue 等操作
 
         # Estimate average pages per pdf
         sample_size = min(100, len(pdf_work_paths))
