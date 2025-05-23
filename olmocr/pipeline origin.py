@@ -30,8 +30,6 @@ from PIL import Image
 from pypdf import PdfReader
 from tqdm import tqdm
 
-from dotenv import load_dotenv
-
 from olmocr.check import (
     check_poppler_version,
     check_sglang_version,
@@ -106,35 +104,36 @@ class PageResult:
     output_tokens: int
     is_fallback: bool
 
-# 修改整个函数 从本地调用改成API调用
-import os
 
 async def build_page_query(local_pdf_path: str, page: int, target_longest_image_dim: int, target_anchor_text_len: int, image_rotation: int = 0) -> dict:
     MAX_TOKENS = 3000
     assert image_rotation in [0, 90, 180, 270], "Invalid image rotation provided in build_page_query"
 
-    # 1. 渲染图片和获取锚文本
+    # Allow the page rendering to process in the background while we get the anchor text (which blocks the main thread)
     image_base64 = asyncio.to_thread(render_pdf_to_base64png, local_pdf_path, page, target_longest_image_dim=target_longest_image_dim)
+
+    # GET ANCHOR TEXT IS NOT THREAD SAFE!! Ahhhh..... don't try to do it
+    # and it's also CPU bound, so it needs to run in a process pool
     loop = asyncio.get_running_loop()
     anchor_text = loop.run_in_executor(
         process_pool, partial(get_anchor_text, pdf_engine="pdfreport", target_length=target_anchor_text_len), local_pdf_path, page
     )
-    image_base64, anchor_text = await asyncio.gather(image_base64, anchor_text)  # type: ignore
 
+    image_base64, anchor_text = await asyncio.gather(image_base64, anchor_text)  # type: ignore
     if image_rotation != 0:
         image_bytes = base64.b64decode(image_base64)
         with Image.open(BytesIO(image_bytes)) as img:
             rotated_img = img.rotate(-image_rotation, expand=True)
+
+            # Save the rotated image to a bytes buffer
             buffered = BytesIO()
             rotated_img.save(buffered, format="PNG")
+
+        # Encode the rotated image back to base64
         image_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
 
-    # 2. 通过环境变量读取 model
-    model_name = os.getenv("OPENAI_API_MODEL", "gpt-4.1")
-
-    # 3. 构造 vision 格式的消息
     return {
-        "model": model_name,
+        "model": "Qwen/Qwen2-VL-7B-Instruct",
         "messages": [
             {
                 "role": "user",
@@ -216,15 +215,6 @@ async def apost(url, json_data):
 
 async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path: str, page_num: int) -> PageResult:
     COMPLETION_URL = f"http://localhost:{SGLANG_SERVER_PORT}/v1/chat/completions"
-    
-    import os
-
-    # 新增：从环境变量读取API参数
-    REMOTE_API_BASE = os.getenv("OPENAI_API_BASE", "").rstrip("/")
-    REMOTE_API_PATH = os.getenv("OPENAI_API_PATH", "").lstrip("/")
-    REMOTE_API_KEY = os.getenv("OPENAI_API_KEY")
-    REMOTE_COMPLETION_URL = f"{REMOTE_API_BASE}/{REMOTE_API_PATH}"
-    
     MAX_RETRIES = args.max_page_retries
     TEMPERATURE_BY_ATTEMPT = [0.1, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
     exponential_backoffs = 0
@@ -237,25 +227,13 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
         query = await build_page_query(pdf_local_path, page_num, args.target_longest_image_dim, local_anchor_text_len, image_rotation=local_image_rotation)
         query["temperature"] = TEMPERATURE_BY_ATTEMPT[
             min(attempt, len(TEMPERATURE_BY_ATTEMPT) - 1)
-        ]
+        ]  # Change temperature as number of attempts increases to overcome repetition issues at expense of quality
+
         logger.info(f"Built page query for {pdf_orig_path}-{page_num}")
 
         try:
-            if getattr(args, "use_remote_api", False):
-                headers = {
-                    "Authorization": f"Bearer {REMOTE_API_KEY}",
-                    "Content-Type": "application/json"
-                }
-                async with httpx.AsyncClient(timeout=120.0) as client: # 新增：120秒超时
-                    response = await client.post(REMOTE_COMPLETION_URL, headers=headers, json=query)
-                    logger.info(f"Debug--API response status: {response.status_code}, body: {response.text}")
-         
-                    status_code = response.status_code
-                    response_body = response.content
-            else:
-                status_code, response_body = await apost(COMPLETION_URL, json_data=query)
+            status_code, response_body = await apost(COMPLETION_URL, json_data=query)
 
-            # 后续处理（无论哪种分支都要有）
             if status_code == 400:
                 raise ValueError(f"Got BadRequestError from server: {response_body}, skipping this response")
             elif status_code == 500:
@@ -274,20 +252,8 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
                 sglang_input_tokens=base_response_data["usage"].get("prompt_tokens", 0),
                 sglang_output_tokens=base_response_data["usage"].get("completion_tokens", 0),
             )
-            content = base_response_data["choices"][0]["message"]["content"]
-            
-            try:
-                model_response_json = json.loads(content)
-            except json.JSONDecodeError:
-                # 兼容API返回纯文本
-                model_response_json = {
-                    "natural_text": content,
-                    "primary_language": None,
-                    "is_rotation_valid": True,
-                    "rotation_correction": 0,
-                    "is_table": False,
-                    "is_diagram": False
-                }
+
+            model_response_json = json.loads(base_response_data["choices"][0]["message"]["content"])
             page_response = PageResponse(**model_response_json)
 
             if not page_response.is_rotation_valid and attempt < MAX_RETRIES - 1:
@@ -310,6 +276,8 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
             logger.warning(f"Client error on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} {e}")
 
             # Now we want to do exponential backoff, and not count this as an actual page retry
+            # Page retrys are supposed to be for fixing bad results from the model, but actual requests to sglang
+            # are supposed to work. Probably this means that the server is just restarting
             sleep_delay = 10 * (2**exponential_backoffs)
             exponential_backoffs += 1
             logger.info(f"Sleeping for {sleep_delay} seconds on {pdf_orig_path}-{page_num} to allow server restart")
@@ -327,12 +295,15 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
         except Exception as e:
             logger.exception(f"Unexpected error on attempt {attempt} for {pdf_orig_path}-{page_num}: {type(e)} - {e}")
             attempt += 1
-    # 如果所有尝试都失败，返回一个 fallback PageResult
+
+    logger.error(f"Failed to process {pdf_orig_path}-{page_num} after {MAX_RETRIES} attempts.")
+    await tracker.track_work(worker_id, f"{pdf_orig_path}-{page_num}", "errored")
+
     return PageResult(
         pdf_orig_path,
         page_num,
         PageResponse(
-            natural_text=None,
+            natural_text=get_anchor_text(pdf_local_path, page_num, pdf_engine="pdftotext"),
             primary_language=None,
             is_rotation_valid=True,
             rotation_correction=0,
@@ -343,6 +314,7 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
         output_tokens=0,
         is_fallback=True,
     )
+
 
 async def process_pdf(args, worker_id: int, pdf_orig_path: str):
     with tempfile.NamedTemporaryFile("wb+", suffix=".pdf") as tf:
@@ -506,20 +478,7 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
 
             try:
                 # Define the output S3 path using the work_hash
-                # output_final_path = os.path.join(args.workspace, "results", f"output_{work_item.hash}.jsonl")
-                # 优化为：md/jsonl都写到pdf目录的平行目录
-                if len(work_item.work_paths) == 1:
-                    pdf_path = work_item.work_paths[0]
-                    pdf_dir = os.path.dirname(pdf_path)
-                    pdf_basename = os.path.splitext(os.path.basename(pdf_path))[0]
-                    parent_dir = os.path.dirname(pdf_dir)
-                    dir_name = os.path.basename(pdf_dir)
-                    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-                    target_dir = os.path.join(parent_dir, f"{dir_name}_md+jsonl_{timestamp}")
-                    os.makedirs(target_dir, exist_ok=True)
-                    output_final_path = os.path.join(target_dir, f"output_{pdf_basename}.jsonl")
-                else:
-                    output_final_path = os.path.join(args.workspace, "results", f"output_{work_item.hash}.jsonl")
+                output_final_path = os.path.join(args.workspace, "results", f"output_{work_item.hash}.jsonl")
 
                 if output_final_path.startswith("s3://"):
                     bucket, key = parse_s3_path(output_final_path)
@@ -527,6 +486,7 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
                 else:
                     shutil.copyfile(temp_path, output_final_path)
             finally:
+                # Clean up the temporary file
                 if os.path.exists(temp_path):
                     os.unlink(temp_path)
 
@@ -534,14 +494,47 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
             if args.markdown:
                 logger.info(f"Writing {len(dolma_docs)} markdown files for {work_item.hash}")
                 for doc in dolma_docs:
-                    print("DEBUG: doc Source-File:", doc["metadata"]["Source-File"])
                     source_file = doc["metadata"]["Source-File"]
                     natural_text = doc["text"]
-                    md_filename = os.path.splitext(os.path.basename(source_file))[0] + ".md"
-                    # md 文件也写到 target_dir
-                    markdown_path = os.path.join(target_dir, md_filename)
-                    with open(markdown_path, "w") as md_f:
-                        md_f.write(natural_text)
+
+                    # Create the output markdown path that preserves the folder structure
+                    if source_file.startswith("s3://"):
+                        # Extract the path after the bucket name for S3 sources
+                        parsed = urlparse(source_file)
+                        relative_path = parsed.path.lstrip("/")
+                    else:
+                        # For local files, use the full path
+                        relative_path = source_file
+
+                    # Change the extension to .md
+                    md_filename = os.path.splitext(os.path.basename(relative_path))[0] + ".md"
+                    # Get the directory path without the filename
+                    dir_path = os.path.dirname(relative_path)
+
+                    # Create the output markdown path
+                    markdown_dir = os.path.join(args.workspace, "markdown", dir_path)
+                    markdown_path = os.path.join(markdown_dir, md_filename)
+
+                    # Create the directory structure if it doesn't exist
+                    if markdown_path.startswith("s3://"):
+                        # For S3 paths, we'll create a temporary file and upload it
+                        with tempfile.NamedTemporaryFile(mode="w+", delete=False) as md_tf:
+                            md_tf.write(natural_text)
+                            md_tf.flush()
+                            md_temp_path = md_tf.name
+
+                        try:
+                            md_bucket, md_key = parse_s3_path(markdown_path)
+                            workspace_s3.upload_file(md_temp_path, md_bucket, md_key)
+                        finally:
+                            # Make sure to clean up the temporary file even if upload fails
+                            if os.path.exists(md_temp_path):
+                                os.unlink(md_temp_path)
+                    else:
+                        # For local paths, create the directory structure and write the file
+                        os.makedirs(markdown_dir, exist_ok=True)
+                        with open(markdown_path, "w") as md_f:
+                            md_f.write(natural_text)
 
             # Update finished token counts from successful documents
             metrics.add_metrics(
@@ -963,44 +956,12 @@ def print_stats(args, root_work_queue):
     print(f"Total tokens in long context documents: {long_context_tokens_total:,}")
 
 
-import glob
-import os
-
-def clean_workspace_queue_files(workspace_path):
-    if not workspace_path.startswith("s3://"):
-        queue_patterns = [
-            "work_index_list.csv.zstd",
-            "local_queue.json",
-            "work_index_list.csv",
-            "work_index_list.csv.zst",
-            "work_index_list.csv.gz",
-        ]
-        for pattern in queue_patterns:
-            for file in glob.glob(os.path.join(workspace_path, pattern)):
-                try:
-                    os.remove(file)
-                    print(f"DEBUG: Removed old queue file: {file}")
-                except Exception as e:
-                    print(f"DEBUG: Failed to remove {file}: {e}")
 async def main():
-    # 加载本地环境变量
-    load_dotenv(
-        dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), "local.env"),
-        override=True  # 强制覆盖已有环境变量
-    )
-    print("DEBUG: REMOTE_API_BASE =", os.getenv("OPENAI_API_BASE"))
-    print("DEBUG: REMOTE_API_PATH =", os.getenv("OPENAI_API_PATH"))
-    print("DEBUG: REMOTE_API_KEY =", os.getenv("OPENAI_API_KEY"))
     parser = argparse.ArgumentParser(description="Manager for running millions of PDFs through a batch inference pipeline")
-    #  在 argparse 添加参数，支持切换API模式
-    parser.add_argument("--use_remote_api", action="store_true", help="Use remote API instead of local LLM")
-    # 将 workspace 参数改为可选
     parser.add_argument(
         "workspace",
-        nargs="?",
-        default=".",
-        help="The filesystem path where work will be stored, can be a local folder, or an s3 path if coordinating work with many workers, s3://bucket/prefix/. Default: current directory",
-)
+        help="The filesystem path where work will be stored, can be a local folder, or an s3 path if coordinating work with many workers, s3://bucket/prefix/ ",
+    )
     parser.add_argument(
         "--pdfs",
         nargs="*",
@@ -1040,11 +1001,6 @@ async def main():
     parser.add_argument("--beaker_priority", type=str, default="normal", help="Beaker priority level for the job")
     parser.add_argument("--port", type=int, default=30024, help="Port to use for the SGLang server")
     args = parser.parse_args()
-    
-    # ====== 这里插入清理队列文件的代码 ======
-    if args.pdfs:
-        clean_workspace_queue_files(args.workspace)
-    # =====================================
 
     global workspace_s3, pdf_s3
     # set the global SGLANG_SERVER_PORT from args
@@ -1155,8 +1111,6 @@ async def main():
 
         # Now call populate_queue
         await work_queue.populate_queue(pdf_work_paths, items_per_group)
-        qsize = await work_queue.initialize_queue()
-        logger.info(f"添加debug--Initialized work queue size: {qsize}")      
 
     if args.stats:
         print_stats(args, work_queue)
@@ -1167,26 +1121,29 @@ async def main():
         return
 
     # If you get this far, then you are doing inference and need a GPU
-    # 修改
-    if not args.use_remote_api:
-        # Only check local LLM dependencies if not using remote API
-        check_sglang_version()
-        check_torch_gpu_available()
+    check_sglang_version()
+    check_torch_gpu_available()
 
-    # 以下修改到logger.info("Work done")
     logger.info(f"Starting pipeline with PID {os.getpid()}")
 
-    if not args.use_remote_api:
-        # 本地LLM模式：下载模型、启动sglang server
-        model_name_or_path = await download_model(args.model)
-        semaphore = asyncio.Semaphore(1)
-        sglang_server = asyncio.create_task(sglang_server_host(model_name_or_path, args, semaphore))
-        await sglang_server_ready()
-    else:
-        # 远程API模式：不下载模型、不启动sglang server
-        model_name_or_path = None
-        semaphore = asyncio.Semaphore(1)
-        sglang_server = None
+    # Download the model before you do anything else
+    model_name_or_path = await download_model(args.model)
+
+    # Initialize the work queue
+    qsize = await work_queue.initialize_queue()
+
+    if qsize == 0:
+        logger.info("No work to do, exiting")
+        return
+    # Create a semaphore to control worker access
+    # We only allow one worker to move forward with requests, until the server has no more requests in its queue
+    # This lets us get full utilization by having many workers, but also to be outputting dolma docs as soon as possible
+    # As soon as one worker is no longer saturating the gpu, the next one can start sending requests
+    semaphore = asyncio.Semaphore(1)
+
+    sglang_server = asyncio.create_task(sglang_server_host(model_name_or_path, args, semaphore))
+
+    await sglang_server_ready()
 
     metrics_task = asyncio.create_task(metrics_reporter(work_queue))
 
@@ -1202,8 +1159,7 @@ async def main():
     # Wait for server to stop
     process_pool.shutdown(wait=False)
 
-    if sglang_server is not None:
-        sglang_server.cancel()
+    sglang_server.cancel()
     metrics_task.cancel()
     logger.info("Work done")
 

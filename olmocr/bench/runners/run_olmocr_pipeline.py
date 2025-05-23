@@ -27,7 +27,7 @@ class Args:
     target_longest_image_dim: int = 1024
     target_anchor_text_len: int = 6000
     max_page_retries: int = 3       # 从8设置为3
-    max_page_error_rate: float = 1  # 临时设置大一点
+    max_page_error_rate: float = 1  # 容错参数 最多允许多少页解析失败；如追求高质量数据，保持较低阈值
 
 
 server_check_lock = asyncio.Lock()
