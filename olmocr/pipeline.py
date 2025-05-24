@@ -499,57 +499,77 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
 
             # === 优化后的输出逻辑，支持单文件和多文件/目录 ===
             pdf_paths = work_item.work_paths
+
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+            if args.only_markdown:
+                suffix = f"_md_{timestamp}"
+            else:
+                suffix = f"_md+jsonl_{timestamp}"
+
             if len(pdf_paths) == 1:
-                # 单文件，兼容原有逻辑
+                # 单文件：直接写到 PDF 同目录
                 pdf_path = pdf_paths[0]
                 pdf_dir = os.path.dirname(pdf_path)
-                parent_dir = os.path.dirname(pdf_dir)
-                dir_name = os.path.basename(pdf_dir)
-                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-                target_root_dir = os.path.join(parent_dir, f"{dir_name}_md+jsonl_{timestamp}")
-                os.makedirs(target_root_dir, exist_ok=True)
-                rel_dir = ""
-                common_prefix = pdf_dir  # 兼容后续 relpath
+                for doc in dolma_docs:
+                    source_file = doc["metadata"]["Source-File"]
+                    natural_text = doc["text"]
+                    pdf_basename = os.path.splitext(os.path.basename(source_file))[0]
+                    # 直接写到 pdf_dir
+                    target_dir = pdf_dir
+                    os.makedirs(target_dir, exist_ok=True)
+                    # 写 md
+                    if args.markdown_jsonl or args.only_markdown:
+                        md_filename = f"{pdf_basename}.md"
+                        markdown_path = os.path.join(target_dir, md_filename)
+                        print(f"DEBUG: Writing md to {markdown_path}")
+                        with open(markdown_path, "w") as md_f:
+                            md_f.write(natural_text)
+                    # 写 jsonl（仅当不是 only_markdown 时）
+                    if not args.only_markdown:
+                        output_final_path = os.path.join(target_dir, f"output_{pdf_basename}.jsonl")
+                        print(f"DEBUG: Writing jsonl to {output_final_path}")
+                        with open(output_final_path, "w") as jf:
+                            jf.write(json.dumps(doc, ensure_ascii=False) + "\n")
             else:
-                # 多文件，找出共同父目录
                 from os.path import commonprefix, dirname, relpath, join, basename, splitext
                 common_prefix = os.path.commonprefix(pdf_paths)
                 if not os.path.isdir(common_prefix):
                     common_prefix = os.path.dirname(common_prefix)
                 dir_name = os.path.basename(common_prefix.rstrip("/"))
                 parent_dir = os.path.dirname(common_prefix.rstrip("/"))
-                timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-                target_root_dir = os.path.join(parent_dir, f"{dir_name}_md+jsonl_{timestamp}")
+                target_root_dir = os.path.join(parent_dir, f"{dir_name}{suffix}")
                 os.makedirs(target_root_dir, exist_ok=True)
 
-            for doc in dolma_docs:
-                source_file = doc["metadata"]["Source-File"]
-                natural_text = doc["text"]
-                pdf_basename = os.path.splitext(os.path.basename(source_file))[0]
-                # 计算相对路径
-                if len(pdf_paths) == 1:
-                    rel_dir = ""
-                else:
-                    rel_dir = os.path.dirname(os.path.relpath(source_file, common_prefix))
-                target_dir = os.path.join(target_root_dir, rel_dir)
-                os.makedirs(target_dir, exist_ok=True)
-                # 写 jsonl
-                output_final_path = os.path.join(target_dir, f"output_{pdf_basename}.jsonl")
-                with open(output_final_path, "w") as jf:
-                    jf.write(json.dumps(doc, ensure_ascii=False) + "\n")
-                # 写 md
-                if args.markdown:
-                    md_filename = f"{pdf_basename}.md"
-                    markdown_path = os.path.join(target_dir, md_filename)
-                    with open(markdown_path, "w") as md_f:
-                        md_f.write(natural_text)
 
-            metrics.add_metrics(
-                finished_input_tokens=sum(doc["metadata"]["total-input-tokens"] for doc in dolma_docs),
-                finished_output_tokens=sum(doc["metadata"]["total-output-tokens"] for doc in dolma_docs),
-            )
+                for doc in dolma_docs:
+                    source_file = doc["metadata"]["Source-File"]
+                    natural_text = doc["text"]
+                    pdf_basename = os.path.splitext(os.path.basename(source_file))[0]
+                    # 计算相对路径
+                    if len(pdf_paths) == 1:
+                        rel_dir = ""
+                    else:
+                        rel_dir = os.path.dirname(os.path.relpath(source_file, common_prefix))
+                    target_dir = os.path.join(target_root_dir, rel_dir)
+                    os.makedirs(target_dir, exist_ok=True)
+                    # 写 md
+                    if args.markdown_jsonl or args.only_markdown:
+                        md_filename = f"{pdf_basename}.md"
+                        markdown_path = os.path.join(target_dir, md_filename)
+                        with open(markdown_path, "w") as md_f:
+                            md_f.write(natural_text)
+                    # 写 jsonl（仅当不是 only_markdown 时）
+                    if not args.only_markdown:
+                        output_final_path = os.path.join(target_dir, f"output_{pdf_basename}.jsonl")
+                        with open(output_final_path, "w") as jf:
+                            jf.write(json.dumps(doc, ensure_ascii=False) + "\n")
 
-            await work_queue.mark_done(work_item)
+            if not args.only_markdown:
+                metrics.add_metrics(
+                    finished_input_tokens=sum(doc["metadata"]["total-input-tokens"] for doc in dolma_docs),
+                    finished_output_tokens=sum(doc["metadata"]["total-output-tokens"] for doc in dolma_docs),
+                )
+                await work_queue.mark_done(work_item)
         except Exception as e:
             logger.exception(f"Exception occurred while processing work_hash {work_item.hash}: {e}")
         finally:
@@ -993,6 +1013,56 @@ def clean_workspace_queue_files(workspace_path):
                     print(f"DEBUG: Removed old queue file: {file}")
                 except Exception as e:
                     print(f"DEBUG: Failed to remove {file}: {e}")
+                    
+def clean_all_workspace_files(workspace_path):
+    import shutil
+    # 清理队列文件
+    clean_workspace_queue_files(workspace_path)
+    # 清理 results 目录下所有文件
+    results_dir = os.path.join(workspace_path, "results")
+    if os.path.exists(results_dir):
+        shutil.rmtree(results_dir)
+    # 清理 worker_locks 目录
+    locks_dir = os.path.join(workspace_path, "worker_locks")
+    if os.path.exists(locks_dir):
+        shutil.rmtree(locks_dir)
+    # 清理 workspace 下所有状态文件
+    for file in os.listdir(workspace_path):
+        file_path = os.path.join(workspace_path, file)
+        if os.path.isfile(file_path) and (
+            file_path.endswith(".jsonl")
+            or file_path.endswith(".md")
+            or file_path.endswith(".csv")
+            or file_path.endswith(".zstd")
+            or file_path.endswith(".json")
+            or file_path.endswith(".gz")
+            or file_path.endswith(".zst")
+            or file_path.endswith(".done")
+            or file_path.endswith(".index")
+            or file_path.endswith(".cache")
+            or file_path.endswith(".lock")
+            or file_path.endswith(".tmp")
+        ):
+            try:
+                os.remove(file_path)
+            except Exception as e:
+                print(f"Failed to remove {file_path}: {e}")            
+             
+import os
+
+def has_old_queue_files(workspace_path):
+    queue_patterns = [
+        "work_index_list.csv.zstd",
+        "local_queue.json",
+        "work_index_list.csv",
+        "work_index_list.csv.zst",
+        "work_index_list.csv.gz",
+    ]
+    for pattern in queue_patterns:
+        for file in glob.glob(os.path.join(workspace_path, pattern)):
+            if os.path.exists(file):
+                return True
+    return False                    
 async def main():
     # 加载本地环境变量
     load_dotenv(
@@ -1026,7 +1096,11 @@ async def main():
     parser.add_argument("--workers", type=int, default=8, help="Number of workers to run at a time")
     parser.add_argument("--apply_filter", action="store_true", help="Apply basic filtering to English pdfs which are not forms, and not likely seo spam")
     parser.add_argument("--stats", action="store_true", help="Instead of running any job, reports some statistics about the current workspace")
-    parser.add_argument("--markdown", action="store_true", help="Also write natural text to markdown files preserving the folder structure of the input pdfs")
+    parser.add_argument("--markdown_jsonl", action="store_true", help="Write both markdown and jsonl files (preserving folder structure)")
+    # 添加参数"--only_markdown"
+    parser.add_argument("--only_markdown", action="store_true", help="Only write markdown files, do not write jsonl files")
+
+
 
     # Model parameters
     parser.add_argument(
@@ -1051,12 +1125,16 @@ async def main():
     parser.add_argument("--beaker_priority", type=str, default="normal", help="Beaker priority level for the job")
     parser.add_argument("--port", type=int, default=30024, help="Port to use for the SGLang server")
     args = parser.parse_args()
-    
-    # ====== 这里插入清理队列文件的代码 ======
+    # ====== 自动化清理：每次新命令执行前，先清理老队列文件 ======
     if args.pdfs:
-        clean_workspace_queue_files(args.workspace)
-    # =====================================
+        clean_all_workspace_files(args.workspace)
+    # =====================================    
 
+    # ====== 这里添加对两个参数同时出现的错误提醒 ======
+    if args.markdown_jsonl and args.only_markdown:
+        parser.error("Cannot use --markdown_jsonl and --only_markdown together.")
+    # =====================================
+        
     global workspace_s3, pdf_s3
     # set the global SGLANG_SERVER_PORT from args
     global SGLANG_SERVER_PORT
@@ -1170,24 +1248,22 @@ async def main():
         semaphore = asyncio.Semaphore(1)
         sglang_server = None
 
+    
+    # 下面所有主流程都放在 try 里
     metrics_task = asyncio.create_task(metrics_reporter(work_queue))
-
-    # Create worker tasks to process the queue concurrently.
     worker_tasks = []
     for i in range(args.workers):
         task = asyncio.create_task(worker(args, work_queue, semaphore, worker_id=i))
         worker_tasks.append(task)
 
-    # Wait for all worker tasks to finish
     await asyncio.gather(*worker_tasks)
-
-    # Wait for server to stop
     process_pool.shutdown(wait=False)
-
     if sglang_server is not None:
         sglang_server.cancel()
     metrics_task.cancel()
     logger.info("Work done")
+    
+  
 
 
 if __name__ == "__main__":
