@@ -55,9 +55,6 @@ from olmocr.s3_utils import (
 from olmocr.version import VERSION
 from olmocr.work_queue import LocalWorkQueue, S3WorkQueue, WorkQueue
 
-from pathlib import Path
-from tabulate import tabulate  # 需要安装：pip install tabulate
-
 # Initialize logger
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -251,8 +248,16 @@ async def process_page(args, worker_id: int, pdf_orig_path: str, pdf_local_path:
                     "Content-Type": "application/json"
                 }
                 async with httpx.AsyncClient(timeout=120.0) as client: # 新增：120秒超时
-                    response = await client.post(REMOTE_COMPLETION_URL, headers=headers, json=query)
+                    # response = await client.post(REMOTE_COMPLETION_URL, headers=headers, json=query)
                     # logger.info(f"Debug--API response status: {response.status_code}, body: {response.text}") # body日志
+                    start_time = time.time()  # 记录开始时间
+                    response = await client.post(REMOTE_COMPLETION_URL, headers=headers, json=query)
+                    elapsed_time = time.time() - start_time  # 计算耗时
+                    logger.info(
+                        f"API request for {pdf_orig_path}-{page_num} completed, "
+                        f"status: {response.status_code}, "
+                        f"elapsed_time: {elapsed_time:.2f}s"
+                    )
          
                     status_code = response.status_code
                     response_body = response.content
@@ -465,95 +470,7 @@ def build_dolma_document(pdf_orig_path, page_results):
     return dolma_doc
 
 
-@dataclass
-class PdfStats:
-    pdf_path: str
-    page_count: int
-    file_size_bytes: int
-    markdown_char_count: int
-    markdown_line_count: int
-
-def collect_pdf_stats(pdf_path: str, markdown_path: str) -> PdfStats:
-    """收集单个 PDF 和其对应 Markdown 的统计信息"""
-    try:
-        with open(pdf_path, "rb") as f:
-            reader = PdfReader(f)
-            page_count = len(reader.pages)
-        file_size = os.path.getsize(pdf_path)
-        with open(markdown_path, "r", encoding="utf-8") as f:
-            markdown_content = f.read()
-            markdown_char_count = len(markdown_content)
-            markdown_line_count = len(markdown_content.splitlines())
-        return PdfStats(
-            pdf_path=pdf_path,
-            page_count=page_count,
-            file_size_bytes=file_size,
-            markdown_char_count=markdown_char_count,
-            markdown_line_count=markdown_line_count
-        )
-    except Exception as e:
-        logger.warning(f"Failed to collect stats for {pdf_path}: {e}")
-        return PdfStats(pdf_path=pdf_path, page_count=0, file_size_bytes=0, markdown_char_count=0, markdown_line_count=0)
-
-def summarize_directory_stats(pdf_paths: list[str], markdown_paths: dict[str, str]) -> dict:
-    """统计文件夹结构和每个 PDF 的信息"""
-    stats = []
-    folder_structure = {}
-    
-    for pdf_path in pdf_paths:
-        pdf_dir = os.path.dirname(pdf_path)
-        pdf_basename = os.path.basename(pdf_path)
-        if pdf_dir not in folder_structure:
-            folder_structure[pdf_dir] = []
-        folder_structure[pdf_dir].append(pdf_path)
-        
-        markdown_path = markdown_paths.get(pdf_path, "")
-        if markdown_path and os.path.exists(markdown_path):
-            stat = collect_pdf_stats(pdf_path, markdown_path)
-            stats.append(stat)
-    
-    return {
-        "stats": stats,
-        "folder_structure": folder_structure
-    }
-
-def print_stats_summary(stats_data: dict):
-    """打印统计信息表格"""
-    stats = stats_data["stats"]
-    folder_structure = stats_data["folder_structure"]
-    
-    # 打印文件夹结构概览
-    logger.info("Directory Structure Summary:")
-    folder_table = []
-    for folder, pdfs in folder_structure.items():
-        folder_table.append([folder, len(pdfs)])
-    logger.info(tabulate(folder_table, headers=["Folder Path", "PDF Count"], tablefmt="grid"))
-    
-    # 打印详细统计
-    if stats:
-        logger.info("\nDetailed PDF Statistics:")
-        table_data = [
-            [
-                Path(stat.pdf_path).name,
-                stat.page_count,
-                f"{stat.file_size_bytes / 1024:.2f} KB",
-                stat.markdown_char_count,
-                stat.markdown_line_count
-            ]
-            for stat in stats
-        ]
-        logger.info(
-            tabulate(
-                table_data,
-                headers=["PDF Name", "PDF Pages", "PDF Size", "MD Chars", "MD Lines"],
-                tablefmt="grid"
-            )
-        )
-
 async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
-    markdown_paths = {}  # 存储 PDF 路径到 Markdown 路径的映射
-    all_pdf_paths = set()  # 存储所有处理的 PDF 路径
-    
     while True:
         # Wait until allowed to proceed
         await semaphore.acquire()
@@ -567,7 +484,6 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
 
         logger.info(f"Worker {worker_id} processing work item {work_item.hash}")
         await tracker.clear_work(worker_id)
-        all_pdf_paths.update(work_item.work_paths)  # 记录 PDF 路径
 
         try:
             async with asyncio.TaskGroup() as tg:
@@ -616,7 +532,6 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
                         print(f"DEBUG: Writing md to {markdown_path}")
                         with open(markdown_path, "w") as md_f:
                             md_f.write(natural_text)
-                        markdown_paths[source_file] = markdown_path  # 记录 Markdown 路径
                     # 写 jsonl（仅当不是 only_markdown 时）
                     if not args.only_markdown:
                         output_final_path = os.path.join(target_dir, f"output_{pdf_basename}.jsonl")
@@ -633,6 +548,7 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
                 target_root_dir = os.path.join(parent_dir, f"{dir_name}{suffix}")
                 os.makedirs(target_root_dir, exist_ok=True)
 
+
                 for doc in dolma_docs:
                     source_file = doc["metadata"]["Source-File"]
                     natural_text = doc["text"]
@@ -648,10 +564,8 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
                     if args.markdown_jsonl or args.only_markdown:
                         md_filename = f"{pdf_basename}.md"
                         markdown_path = os.path.join(target_dir, md_filename)
-                        print(f"DEBUG: Writing md to {markdown_path}")
                         with open(markdown_path, "w") as md_f:
                             md_f.write(natural_text)
-                        markdown_paths[source_file] = markdown_path  # 记录 Markdown 路径
                     # 写 jsonl（仅当不是 only_markdown 时）
                     if not args.only_markdown:
                         output_final_path = os.path.join(target_dir, f"output_{pdf_basename}.jsonl")
@@ -668,11 +582,6 @@ async def worker(args, work_queue: WorkQueue, semaphore, worker_id):
             logger.exception(f"Exception occurred while processing work_hash {work_item.hash}: {e}")
         finally:
             semaphore.release()
-    
-    # 在所有工作完成后打印统计信息
-    if all_pdf_paths:
-        stats_data = summarize_directory_stats(list(all_pdf_paths), markdown_paths)
-        print_stats_summary(stats_data)
 
 async def sglang_server_task(model_name_or_path, args, semaphore):
     # Check GPU memory, lower mem devices need a bit less KV cache space because the VLM takes additional memory
@@ -1162,87 +1071,84 @@ def has_old_queue_files(workspace_path):
             if os.path.exists(file):
                 return True
     return False                    
-
 async def main():
-    # 加载本地环境变量，确保配置（如 API 密钥）正确加载
+    # 加载本地环境变量
     load_dotenv(
         dotenv_path=os.path.join(os.path.dirname(os.path.dirname(__file__)), "local.env"),
         override=True  # 强制覆盖已有环境变量
     )
-    # 调试输出：打印远程 API 配置信息
     print("DEBUG: REMOTE_API_BASE =", os.getenv("OPENAI_API_BASE"))
     print("DEBUG: REMOTE_API_PATH =", os.getenv("OPENAI_API_PATH"))
     print("DEBUG: REMOTE_API_KEY =", os.getenv("OPENAI_API_KEY"))
-
-    # 初始化命令行参数解析器
     parser = argparse.ArgumentParser(description="Manager for running millions of PDFs through a batch inference pipeline")
-    # 添加远程 API 模式开关
-    parser.add_argument("--use_remote_api", action="store_true", help="使用远程 API 而非本地 LLM")
-    # 工作空间路径，可选，默认为当前目录
+    #  在 argparse 添加参数，支持切换API模式
+    parser.add_argument("--use_remote_api", action="store_true", help="Use remote API instead of local LLM")
+    # 将 workspace 参数改为可选
     parser.add_argument(
         "workspace",
         nargs="?",
         default=".",
-        help="工作存储路径，可为本地文件夹或 S3 路径（如 s3://bucket/prefix/）。默认：当前目录",
-    )
-    # PDF 文件路径，支持通配符或文件列表
+        help="The filesystem path where work will be stored, can be a local folder, or an s3 path if coordinating work with many workers, s3://bucket/prefix/. Default: current directory",
+)
     parser.add_argument(
         "--pdfs",
         nargs="*",
-        help="添加存储在 S3 的 PDF 路径，支持通配符（如 s3://bucket/prefix/*.pdf）或包含 PDF 路径的列表文件",
+        help="Path to add pdfs stored in s3 to the workspace, can be a glob path s3://bucket/prefix/*.pdf or path to file containing list of pdf paths",
         default=None,
     )
-    parser.add_argument("--workspace_profile", help="访问工作空间的 S3 配置 profile", default=None)
-    parser.add_argument("--pdf_profile", help="访问原始 PDF 文档的 S3 配置 profile", default=None)
-    parser.add_argument("--pages_per_group", type=int, default=500, help="每个工作项组的目标 PDF 页面数")
-    parser.add_argument("--max_page_retries", type=int, default=8, help="页面渲染的最大重试次数")
-    parser.add_argument("--max_page_error_rate", type=float, default=0.004, help="文档中允许的页面失败率，默认 1/250")
-    parser.add_argument("--workers", type=int, default=8, help="同时运行的 worker 数量")
-    parser.add_argument("--apply_filter", action="store_true", help="应用过滤器，仅保留英文 PDF，非表单且非 SEO 垃圾内容")
-    parser.add_argument("--stats", action="store_true", help="不运行任务，仅报告当前工作空间的统计信息")
-    parser.add_argument("--markdown_jsonl", action="store_true", help="同时写入 Markdown 和 JSONL 文件（保留文件夹结构）")
-    # 添加仅输出 Markdown 文件的选项
-    parser.add_argument("--only_markdown", action="store_true", help="仅写入 Markdown 文件，不写入 JSONL 文件")
+    parser.add_argument("--workspace_profile", help="S3 configuration profile for accessing the workspace", default=None)
+    parser.add_argument("--pdf_profile", help="S3 configuration profile for accessing the raw pdf documents", default=None)
+    parser.add_argument("--pages_per_group", type=int, default=500, help="Aiming for this many pdf pages per work item group")
+    parser.add_argument("--max_page_retries", type=int, default=8, help="Max number of times we will retry rendering a page")
+    parser.add_argument("--max_page_error_rate", type=float, default=0.004, help="Rate of allowable failed pages in a document, 1/250 by default")
+    parser.add_argument("--workers", type=int, default=8, help="Number of workers to run at a time")
+    parser.add_argument("--apply_filter", action="store_true", help="Apply basic filtering to English pdfs which are not forms, and not likely seo spam")
+    parser.add_argument("--stats", action="store_true", help="Instead of running any job, reports some statistics about the current workspace")
+    parser.add_argument("--markdown_jsonl", action="store_true", help="Write both markdown and jsonl files (preserving folder structure)")
+    # 添加参数"--only_markdown"
+    parser.add_argument("--only_markdown", action="store_true", help="Only write markdown files, do not write jsonl files")
 
-    # 模型相关参数
+
+
+    # Model parameters
     parser.add_argument(
         "--model",
-        help="模型路径，支持多个路径，脚本会选择最快访问的路径",
+        help="List of paths where you can find the model to convert this pdf. You can specify several different paths here, and the script will try to use the one which is fastest to access",
         default="allenai/olmOCR-7B-0225-preview",
     )
-    parser.add_argument("--model_max_context", type=int, default="8192", help="模型微调的最大上下文长度")
-    parser.add_argument("--model_chat_template", type=str, default="qwen2-vl", help="传递给 SGLang 服务器的聊天模板")
-    parser.add_argument("--target_longest_image_dim", type=int, help="PDF 页面渲染的最长边尺寸", default=1024)
-    parser.add_argument("--target_anchor_text_len", type=int, help="锚文本的最大字符数", default=6000)
+    parser.add_argument("--model_max_context", type=int, default="8192", help="Maximum context length that the model was fine tuned under")
+    parser.add_argument("--model_chat_template", type=str, default="qwen2-vl", help="Chat template to pass to sglang server")
+    parser.add_argument("--target_longest_image_dim", type=int, help="Dimension on longest side to use for rendering the pdf pages", default=1024)
+    parser.add_argument("--target_anchor_text_len", type=int, help="Maximum amount of anchor text to use (characters)", default=6000)
 
-    # Beaker 任务参数
-    parser.add_argument("--beaker", action="store_true", help="将任务提交到 Beaker 而非本地运行")
-    parser.add_argument("--beaker_workspace", help="提交任务的 Beaker 工作空间", default="ai2/olmocr")
+    # Beaker/job running stuff
+    parser.add_argument("--beaker", action="store_true", help="Submit this job to beaker instead of running locally")
+    parser.add_argument("--beaker_workspace", help="Beaker workspace to submit to", default="ai2/olmocr")
     parser.add_argument(
         "--beaker_cluster",
-        help="运行任务的 Beaker 集群",
+        help="Beaker clusters you want to run on",
         default=["ai2/jupiter-cirrascale-2", "ai2/ceres-cirrascale", "ai2/neptune-cirrascale", "ai2/saturn-cirrascale", "ai2/augusta-google-1"],
     )
-    parser.add_argument("--beaker_gpus", type=int, default=1, help="运行的 GPU 副本数量")
-    parser.add_argument("--beaker_priority", type=str, default="normal", help="Beaker 任务优先级")
-    parser.add_argument("--port", type=int, default=30024, help="SGLang 服务器使用的端口")
-
-    # 解析命令行参数
+    parser.add_argument("--beaker_gpus", type=int, default=1, help="Number of gpu replicas to run")
+    parser.add_argument("--beaker_priority", type=str, default="normal", help="Beaker priority level for the job")
+    parser.add_argument("--port", type=int, default=30024, help="Port to use for the SGLang server")
     args = parser.parse_args()
-
-    # 自动化清理：如果指定了 PDF 文件路径，清理旧的工作空间队列文件
+    # ====== 自动化清理：每次新命令执行前，先清理老队列文件 ======
     if args.pdfs:
         clean_all_workspace_files(args.workspace)
+    # =====================================    
 
-    # 检查参数冲突：--markdown_jsonl 和 --only_markdown 不能同时使用
+    # ====== 这里添加对两个参数同时出现的错误提醒 ======
     if args.markdown_jsonl and args.only_markdown:
-        parser.error("不能同时使用 --markdown_jsonl 和 --only_markdown。")
-
-    # 设置全局 S3 客户端和 SGLang 服务器端口
-    global workspace_s3, pdf_s3, SGLANG_SERVER_PORT
+        parser.error("Cannot use --markdown_jsonl and --only_markdown together.")
+    # =====================================
+        
+    global workspace_s3, pdf_s3
+    # set the global SGLANG_SERVER_PORT from args
+    global SGLANG_SERVER_PORT
     SGLANG_SERVER_PORT = args.port
 
-    # 配置 Beaker 环境（如果在 Beaker 中运行）
+    # setup the job to work in beaker environment, load secrets, adjust logging, etc.
     if "BEAKER_JOB_NAME" in os.environ:
         sglang_logger.addHandler(console_handler)
         cred_path = os.path.join(os.path.expanduser("~"), ".aws", "credentials")
@@ -1257,42 +1163,44 @@ async def main():
         workspace_s3 = boto3.client("s3")
         pdf_s3 = boto3.client("s3")
 
-        # 错开模型下载时间，避免所有 Beaker 任务同时下载
+        # Wait a little bit so that not all beaker jobs in a task start at the same time and download the model at the same time
         replica_count = int(os.environ.get("BEAKER_REPLICA_COUNT", "1"))
         interval = 10 if (replica_count - 1) * 10 <= 240 else 240 / max(1, replica_count - 1)
         sleep_time = int(int(os.environ.get("BEAKER_REPLICA_RANK", "0")) * interval)
-        logger.info(f"Beaker 任务休眠 {sleep_time} 秒以错开模型下载")
+        logger.info(f"Beaker job sleeping for {sleep_time} seconds to stagger model downloads")
         await asyncio.sleep(sleep_time)
 
-    # 根据配置文件设置 S3 客户端
     if args.workspace_profile:
         workspace_session = boto3.Session(profile_name=args.workspace_profile)
         workspace_s3 = workspace_session.client("s3")
+
     if args.pdf_profile:
         pdf_session = boto3.Session(profile_name=args.pdf_profile)
         pdf_s3 = pdf_session.client("s3")
 
-    # 检查 Poppler 版本（用于加载 PDF）
+    # We need poppler to load the initial pdfs, even if we are not processing them here
     check_poppler_version()
 
-    # 创建工作队列，根据工作空间类型选择 S3 或本地队列
+    # Create work queue
     if args.workspace.startswith("s3://"):
         work_queue = S3WorkQueue(workspace_s3, args.workspace)
     else:
         work_queue = LocalWorkQueue(args.workspace)
 
-    # 处理 PDF 文件路径，填充工作队列
     if args.pdfs:
-        logger.info("收到 --pdfs 参数，将添加到工作队列")
+        logger.info("Got --pdfs argument, going to add to the work queue")
         pdf_work_paths = collect_pdf_files(args.pdfs)
-        logger.info(f"找到 {len(pdf_work_paths):,} 个 PDF 路径待添加")
+        logger.info(f"Found {len(pdf_work_paths):,} total pdf paths to add")
+        # 后续直接用 pdf_work_paths 进行 populate_queue 等操作
 
-        # 估算平均每 PDF 的页面数
+        # Estimate average pages per pdf
         sample_size = min(100, len(pdf_work_paths))
         sampled_pdfs = random.sample(list(pdf_work_paths), sample_size)
         page_counts = []
-        for pdf in tqdm(sampled_pdfs, desc="采样 PDF 以计算平均页面数"):
+
+        for pdf in tqdm(sampled_pdfs, desc="Sampling PDFs to calculate optimal length"):
             try:
+                # Download the PDF to a temp file
                 with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp_file:
                     tmp_file.write(get_s3_bytes(pdf_s3, pdf))
                     tmp_file.flush()
@@ -1302,76 +1210,67 @@ async def main():
                         reader = PdfReader(tmp_file.name)
                         page_counts.append(len(reader.pages))
             except Exception as e:
-                logger.warning(f"无法读取 {pdf}：{e}")
+                logger.warning(f"Failed to read {pdf}: {e}")
+
         if page_counts:
             avg_pages_per_pdf = sum(page_counts) / len(page_counts)
         else:
-            logger.warning("无法读取任何 PDF 以估算平均页面数。")
-            avg_pages_per_pdf = 10  # 默认 10 页
-        items_per_group = max(1, int(args.pages_per_group / avg_pages_per_pdf))
-        logger.info(f"根据平均页面数 {avg_pages_per_pdf:.2f} 计算 items_per_group：{items_per_group}")
+            logger.warning("Could not read any PDFs to estimate average page count.")
+            avg_pages_per_pdf = 10  # Default to 10 pages per PDF if sampling fails
 
-        # 填充工作队列
+        items_per_group = max(1, int(args.pages_per_group / avg_pages_per_pdf))
+        logger.info(f"Calculated items_per_group: {items_per_group} based on average pages per PDF: {avg_pages_per_pdf:.2f}")
+
+        # Now call populate_queue
         await work_queue.populate_queue(pdf_work_paths, items_per_group)
         qsize = await work_queue.initialize_queue()
-        logger.info(f"DEBUG：初始化工作队列大小：{qsize}")
+        logger.info(f"添加debug--Initialized work queue size: {qsize}")      
 
-    # 如果指定了 --stats，仅打印统计信息并退出
     if args.stats:
         print_stats(args, work_queue)
         return
 
-    # 如果指定了 --beaker，提交 Beaker 任务并退出
     if args.beaker:
         submit_beaker_job(args)
         return
 
-    # 如果未使用远程 API，检查本地 LLM 依赖
+    # If you get this far, then you are doing inference and need a GPU
+    # 修改
     if not args.use_remote_api:
+        # Only check local LLM dependencies if not using remote API
         check_sglang_version()
         check_torch_gpu_available()
 
-    # 记录管道启动
-    logger.info(f"启动管道，进程 ID：{os.getpid()}")
+    # 以下修改到logger.info("Work done")
+    logger.info(f"Starting pipeline with PID {os.getpid()}")
 
-    # 根据模式初始化模型和信号量
     if not args.use_remote_api:
-        # 本地 LLM 模式：下载模型并启动 SGLang 服务器
+        # 本地LLM模式：下载模型、启动sglang server
         model_name_or_path = await download_model(args.model)
         semaphore = asyncio.Semaphore(1)
         sglang_server = asyncio.create_task(sglang_server_host(model_name_or_path, args, semaphore))
         await sglang_server_ready()
     else:
-        # 远程 API 模式：无需模型或服务器
+        # 远程API模式：不下载模型、不启动sglang server
         model_name_or_path = None
         semaphore = asyncio.Semaphore(1)
         sglang_server = None
 
-    # 记录文档解析和 Markdown 输出开始时间
-    start_time = time.time()
-    logger.info("开始文档解析和 Markdown 输出")
-
-    # 启动主处理流程
+    
+    # 下面所有主流程都放在 try 里
     metrics_task = asyncio.create_task(metrics_reporter(work_queue))
     worker_tasks = []
     for i in range(args.workers):
         task = asyncio.create_task(worker(args, work_queue, semaphore, worker_id=i))
         worker_tasks.append(task)
 
-    # 等待所有 worker 任务完成
     await asyncio.gather(*worker_tasks)
-
-    # 记录结束时间并输出总耗时
-    end_time = time.time()
-    total_time = end_time - start_time
-    logger.info(f"文档解析到 Markdown 输出的总处理时间：{total_time:.2f} 秒")
-
-    # 清理资源
     process_pool.shutdown(wait=False)
     if sglang_server is not None:
         sglang_server.cancel()
     metrics_task.cancel()
-    logger.info("工作完成")
+    logger.info("Work done")
+    
   
 
 
